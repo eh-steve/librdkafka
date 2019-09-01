@@ -36,6 +36,7 @@
 #include <assert.h>
 #include <sstream>
 #include <string>
+#include <map>
 
 #include <rapidjson/document.h>
 #include <rapidjson/schema.h>
@@ -53,13 +54,6 @@
  *   and tests that librdkafka consumes them as expected. Refer to
  *   TransactionProducerCli.java for scenarios covered.
  */
-
-
-static void test_assert(bool cond, std::string msg) {
-  if (!cond)
-    Test::Say(msg);
-  assert(cond);
-}
 
 
 class TestEventCb : public RdKafka::EventCb {
@@ -100,9 +94,9 @@ class TestEventCb : public RdKafka::EventCb {
           if (pp == NULL)
             return;
 
-          test_assert(pp->HasMember("hi_offset"),
+          TEST_ASSERT(pp->HasMember("hi_offset"),
                       "hi_offset not found in stats");
-          test_assert(pp->HasMember("ls_offset"),
+          TEST_ASSERT(pp->HasMember("ls_offset"),
                       "ls_offset not found in stats");
 
           partition_0_hi_offset = (*pp)["hi_offset"].GetInt();
@@ -244,7 +238,226 @@ static RdKafka::KafkaConsumer *create_consumer(
   return c;
 }
 
-static void do_test_consumer_txn_test (void) {
+
+static std::vector<std::string> csv_split (const std::string &input) {
+  std::stringstream ss(input);
+  std::vector<std::string> res;
+
+  while (ss.good()) {
+    std::string substr;
+    std::getline(ss, substr, ',');
+    /* Trim */
+    substr.erase(0, substr.find_first_not_of(' '));
+    substr.erase(substr.find_last_not_of(' ')+1);
+    res.push_back(substr);
+  }
+
+  return res;
+}
+
+
+
+enum TransactionType {
+  TransactionType_None,
+  TransactionType_BeginAbort,
+  TransactionType_BeginCommit,
+  TransactionType_BeginOpen,
+  TransactionType_ContinueAbort,
+  TransactionType_ContinueCommit,
+  TransactionType_ContinueOpen
+};
+
+static TransactionType TransactionType_from_string (std::string str) {
+#define _CHKRET(NAME)                           \
+  if (!str.compare(# NAME))                     \
+    return TransactionType_ ## NAME
+
+  _CHKRET(None);
+  _CHKRET(BeginAbort);
+  _CHKRET(BeginCommit);
+  _CHKRET(BeginOpen);
+  _CHKRET(ContinueAbort);
+  _CHKRET(ContinueCommit);
+  _CHKRET(ContinueOpen);
+
+  Test::Fail("Unknown TransactionType: " + str);
+
+  return TransactionType_None;  /* NOTREACHED */
+}
+
+
+static void txn_producer_makeTestMessages (RdKafka::Producer *producer,
+                                           const std::string &topic,
+                                           int partition,
+                                           int idStart,
+                                           int msgcount,
+                                           TransactionType tt,
+                                           bool do_flush) {
+
+  RdKafka::ErrorCode err;
+  std::string errstr;
+
+  if (tt != TransactionType_None &&
+      tt != TransactionType_ContinueOpen &&
+      tt != TransactionType_ContinueCommit &&
+      tt != TransactionType_ContinueAbort) {
+    err = producer->begin_transaction(errstr);
+    if (err)
+      Test::Fail("begin_transaction() failed: " + errstr);
+  }
+
+  for (int i = 0 ; i < msgcount ; i++) {
+    char key[] = { (char)((i + idStart) & 0xff) };
+    char payload[] = { 0x10, 0x20, 0x30, 0x40 };
+
+    err = producer->produce(topic, partition, producer->RK_MSG_COPY,
+                           payload, sizeof(payload),
+                           key, sizeof(key),
+                           0, NULL);
+    if (err)
+      Test::Fail("produce() failed: " + RdKafka::err2str(err));
+  }
+
+  if (do_flush)
+    producer->flush(-1);
+
+  switch (tt) {
+  case TransactionType_BeginAbort:
+  case TransactionType_ContinueAbort:
+    err = producer->abort_transaction(errstr);
+    if (err)
+      Test::Fail("abort_transaction() failed: " + errstr);
+    break;
+
+  case TransactionType_BeginCommit:
+  case TransactionType_ContinueCommit:
+    err = producer->commit_transaction(errstr);
+    if (err)
+      Test::Fail("commit_transaction() failed: " + errstr);
+    break;
+
+  default:
+    break;
+  }
+}
+
+
+class txnDeliveryReportCb : public RdKafka::DeliveryReportCb {
+ public:
+  void dr_cb (RdKafka::Message &msg) {
+    switch (msg.err()) {
+    case RdKafka::ERR__PURGE_QUEUE:
+    case RdKafka::ERR__PURGE_INFLIGHT:
+      /* These are expected when transactions are aborted */
+      break;
+
+    case RdKafka::ERR_NO_ERROR:
+      break;
+
+    default:
+      Test::Fail("Delivery failed: " + msg.errstr());
+      break;
+    }
+  }
+};
+
+
+/**
+ * @brief Transactional producer, performing the commands in \p cmds.
+ *        This is the librdkafka counterpart of
+ *        java/TransactionProducerCli.java
+ */
+static void txn_producer (std::string &brokers, std::string &topic,
+                          std::vector<std::string> cmds) {
+  RdKafka::Conf *conf;
+  txnDeliveryReportCb txn_dr;
+
+  Test::conf_init(&conf, NULL, 0);
+  Test::conf_set(conf, "bootstrap.servers", brokers);
+
+
+  std::map<std::string, RdKafka::Producer*> producers;
+
+  for (std::vector<std::string>::iterator it = cmds.begin();
+       it != cmds.end(); it++) {
+
+    Test::Say(_C_CLR "txn_producer: command: '" + *it + "'\n");
+
+    std::vector<std::string> cmd = csv_split(*it);
+
+    if (!cmd[0].compare("sleep")) {
+      rd_usleep(atoi(cmd[1].c_str()) * 1000, NULL);
+
+    } else if (!cmd[0].compare("exit")) {
+      break;  /* We can't really simulate the Java exit behaviour
+               * from in-process. */
+
+    } else if (!cmd[0].compare("topic")) {
+      topic = cmd[1];
+
+    } else if (cmd[0].find("producer") == 0) {
+      TransactionType txntype = TransactionType_from_string(cmd[4]);
+
+      std::map<std::string, RdKafka::Producer*>::iterator it =
+        producers.find(cmd[0]);
+
+      RdKafka::Producer *producer;
+
+      if (it == producers.end()) {
+        /* Create producer if it doesn't exist */
+        std::string errstr;
+
+        Test::Say(tostr() << "Creating producer " << cmd[0] <<
+                  " with transactiontype " << txntype << " '" << cmd[4] << "'\n");
+        /* Config */
+        Test::conf_set(conf, "enable.idempotence", "true");
+        if (txntype != TransactionType_None)
+          Test::conf_set(conf, "transactional.id",
+                         "test-transactional-id-c-" + cmd[0]);
+        Test::conf_set(conf, "linger.ms", "5"); /* ensure batching */
+        conf->set("dr_cb", &txn_dr, errstr);
+
+        /* Create producer */
+        producer = RdKafka::Producer::create(conf, errstr);
+        if (!producer)
+          Test::Fail("Failed to create producer " + cmd[0] + ": " + errstr);
+
+        /* Init transactions if producer is transactional */
+        if (txntype != TransactionType_None) {
+          RdKafka::ErrorCode err = producer->init_transactions(errstr);
+          if (err)
+            Test::Fail("init_transactions() failed: " + errstr);
+        }
+
+        producers.insert({cmd[0], producer});
+      } else {
+        producer = it->second;
+      }
+
+      txn_producer_makeTestMessages
+        (producer,                  /* producer */
+         topic,                     /* topic */
+         atoi(cmd[1].c_str()),      /* partition */
+         atoi(cmd[2].c_str()),      /* idStart */
+         atoi(cmd[3].c_str()),      /* msg count */
+         txntype,                   /* TransactionType */
+         !cmd[5].compare("DoFlush") /* Flush */);
+
+    } else {
+      Test::Fail("Unknown command: " + cmd[0]);
+    }
+  }
+
+
+  for (std::map<std::string, RdKafka::Producer *>::iterator it =
+         producers.begin(); it != producers.end() ; it++)
+    delete it->second;
+}
+
+
+
+
+static void do_test_consumer_txn_test (bool use_java_producer) {
   std::string errstr;
   std::string topic_name;
   RdKafka::KafkaConsumer *c;
@@ -252,16 +465,25 @@ static void do_test_consumer_txn_test (void) {
 
   std::string bootstrap_servers = get_bootstrap_servers();
 
+  Test::Say(tostr() << _C_BLU "[ Consumer transaction tests using " <<
+            (use_java_producer ? "java" : "librdkafka" ) <<
+            " producer ]\n" _C_CLR);
+
+#define run_producer(CMDS...) do {                                      \
+    if (use_java_producer)                                              \
+      execute_java_produce_cli(bootstrap_servers, topic_name,           \
+                               (std::vector<std::string>){ CMDS });     \
+    else                                                                \
+      txn_producer(bootstrap_servers, topic_name,                       \
+                   (std::vector<std::string>){ CMDS });                 \
+  } while (0)
+
   if (test_quick) {
     Test::Say("Skipping consumer_txn tests 0->4 due to quick mode\n");
     goto test5;
   }
 
-#define run_producer(CMDS...)                                           \
-  execute_java_produce_cli(bootstrap_servers, topic_name,               \
-                           (std::vector<std::string>){ CMDS })
-
-  // Test 0 - basic commit + abort.
+  Test::Say(_C_BLU "Test 0 - basic commit + abort\n" _C_CLR);
 
   topic_name = Test::mk_topic_name("0098-consumer_txn-0", 1);
   c = create_consumer(topic_name, "READ_COMMITTED");
@@ -271,32 +493,40 @@ static void do_test_consumer_txn_test (void) {
                "producer1, -1, 0x10, 5, BeginAbort, DoFlush");
 
   msgs = consume_messages(c, topic_name, 0);
-  test_assert(msgs.size() == 5,
-              tostr() << "Consumed unexpected number of messages. "
-                         "Expected 5, got: "
-                      << msgs.size());
-  test_assert(msgs[0]->key_len() >= 1 && 0 == msgs[0]->key()->c_str()[0],
+  TEST_ASSERT(msgs.size() == 5,
+              "Consumed unexpected number of messages. "
+              "Expected 5, got: %d", (int)msgs.size());
+  TEST_ASSERT(msgs[0]->key_len() >= 1 && 0 == msgs[0]->key()->c_str()[0],
               "Unexpected key");
-  test_assert(msgs[4]->key_len() >= 1 && 4 == msgs[4]->key()->c_str()[0],
+  TEST_ASSERT(msgs[4]->key_len() >= 1 && 4 == msgs[4]->key()->c_str()[0],
               "Unexpected key");
   delete_messages(msgs);
   c->close();
   delete c;
 
+#define expect_msgcnt(msgcnt)                                           \
+  TEST_ASSERT(msgs.size() == msgcnt,                                    \
+              "Expected %d messages, got %d", (int)msgs.size(), msgcnt)
+
+#define expect_key(msgidx,value) do {                                   \
+    TEST_ASSERT(msgs.size() > msgidx,                                   \
+                "Expected at least %d message(s), only got %d",         \
+                msgidx+1, (int)msgs.size());                            \
+    TEST_ASSERT(msgs[msgidx]->key_len() == 1,                           \
+                "Expected msg #%d key to be of size 1, not %d\n",       \
+                msgidx, (int)msgs[msgidx]->key_len());                  \
+    TEST_ASSERT(value == (int)msgs[msgidx]->key()->c_str()[0],          \
+                "Expected msg #%d key 0x%x, not 0x%x",                  \
+                msgidx, value, (int)msgs[msgidx]->key()->c_str()[0]);   \
+  } while (0)
+
   c = create_consumer(topic_name, "READ_UNCOMMITTED");
   msgs = consume_messages(c, topic_name, 0);
-  test_assert(msgs.size() == 10,
-              tostr() << "Consumed unexpected number of messages. "
-                         "Expected 10, got: "
-                      << msgs.size());
-  test_assert(msgs[0]->key_len() >= 1 && 0 == msgs[0]->key()->c_str()[0],
-              "Unexpected key");
-  test_assert(msgs[4]->key_len() >= 1 && 4 == msgs[4]->key()->c_str()[0],
-              "Unexpected key");
-  test_assert(msgs[5]->key_len() >= 1 && 0x10 == msgs[5]->key()->c_str()[0],
-              "Unexpected key");
-  test_assert(msgs[9]->key_len() >= 1 && 0x14 == msgs[9]->key()->c_str()[0],
-              "Unexpected key");
+  expect_msgcnt(10);
+  expect_key(0, 0x0);
+  expect_key(4, 0x4);
+  expect_key(5, 0x10);
+  expect_key(9, 0x14);
   delete_messages(msgs);
 
   Test::delete_topic(c, topic_name.c_str());
@@ -305,7 +535,7 @@ static void do_test_consumer_txn_test (void) {
   delete c;
 
 
-  // Test 0.1
+  Test::Say(_C_BLU "Test 0.1\n" _C_CLR);
 
   topic_name = Test::mk_topic_name("0098-consumer_txn-0.1", 1);
   c = create_consumer(topic_name, "READ_COMMITTED");
@@ -315,13 +545,12 @@ static void do_test_consumer_txn_test (void) {
                "producer1, -1, 0x10, 5, BeginAbort, DoFlush");
 
   msgs = consume_messages(c, topic_name, 0);
-  test_assert(msgs.size() == 5,
-              tostr() << "Consumed unexpected number of messages. "
-                         "Expected 5, got: "
-                      << msgs.size());
-  test_assert(msgs[0]->key_len() >= 1 && 0 == msgs[0]->key()->c_str()[0],
+  TEST_ASSERT(msgs.size() == 5,
+              "Consumed unexpected number of messages. "
+              "Expected 5, got: %d", (int)msgs.size());
+  TEST_ASSERT(msgs[0]->key_len() >= 1 && 0 == msgs[0]->key()->c_str()[0],
               "Unexpected key");
-  test_assert(msgs[4]->key_len() >= 1 && 4 == msgs[4]->key()->c_str()[0],
+  TEST_ASSERT(msgs[4]->key_len() >= 1 && 4 == msgs[4]->key()->c_str()[0],
               "Unexpected key");
   delete_messages(msgs);
   c->close();
@@ -329,17 +558,16 @@ static void do_test_consumer_txn_test (void) {
 
   c = create_consumer(topic_name, "READ_UNCOMMITTED");
   msgs = consume_messages(c, topic_name, 0);
-  test_assert(msgs.size() == 10,
-              tostr() << "Consumed unexpected number of messages. "
-                         "Expected 10, got: "
-                      << msgs.size());
-  test_assert(msgs[0]->key_len() >= 1 && 0 == msgs[0]->key()->c_str()[0],
+  TEST_ASSERT(msgs.size() == 10,
+              "Consumed unexpected number of messages. "
+              "Expected 10, got: %d", (int)msgs.size());
+  TEST_ASSERT(msgs[0]->key_len() >= 1 && 0 == msgs[0]->key()->c_str()[0],
               "Unexpected key");
-  test_assert(msgs[4]->key_len() >= 1 && 4 == msgs[4]->key()->c_str()[0],
+  TEST_ASSERT(msgs[4]->key_len() >= 1 && 4 == msgs[4]->key()->c_str()[0],
               "Unexpected key");
-  test_assert(msgs[5]->key_len() >= 1 && 0x10 == msgs[5]->key()->c_str()[0],
+  TEST_ASSERT(msgs[5]->key_len() >= 1 && 0x10 == msgs[5]->key()->c_str()[0],
               "Unexpected key");
-  test_assert(msgs[9]->key_len() >= 1 && 0x14 == msgs[9]->key()->c_str()[0],
+  TEST_ASSERT(msgs[9]->key_len() >= 1 && 0x14 == msgs[9]->key()->c_str()[0],
               "Unexpected key");
   delete_messages(msgs);
 
@@ -349,7 +577,7 @@ static void do_test_consumer_txn_test (void) {
   delete c;
 
 
-  // Test 0.2
+  Test::Say(_C_BLU "Test 0.2\n" _C_CLR);
 
   topic_name = Test::mk_topic_name("0098-consumer_txn-0.2", 1);
   c = create_consumer(topic_name, "READ_COMMITTED");
@@ -359,13 +587,12 @@ static void do_test_consumer_txn_test (void) {
                "producer1, -1, 0x30, 5, BeginCommit, DoFlush");
 
   msgs = consume_messages(c, topic_name, 0);
-  test_assert(msgs.size() == 5,
-              tostr() << "Consumed unexpected number of messages. "
-                         "Expected 5, got: "
-                      << msgs.size());
-  test_assert(msgs[0]->key_len() >= 1 && 0x30 == msgs[0]->key()->c_str()[0],
+  TEST_ASSERT(msgs.size() == 5,
+              "Consumed unexpected number of messages. "
+              "Expected 5, got: %d", (int)msgs.size());
+  TEST_ASSERT(msgs[0]->key_len() >= 1 && 0x30 == msgs[0]->key()->c_str()[0],
               "Unexpected key");
-  test_assert(msgs[4]->key_len() >= 1 && 0x34 == msgs[4]->key()->c_str()[0],
+  TEST_ASSERT(msgs[4]->key_len() >= 1 && 0x34 == msgs[4]->key()->c_str()[0],
               "Unexpected key");
   delete_messages(msgs);
   c->close();
@@ -373,17 +600,16 @@ static void do_test_consumer_txn_test (void) {
 
   c = create_consumer(topic_name, "READ_UNCOMMITTED");
   msgs = consume_messages(c, topic_name, 0);
-  test_assert(msgs.size() == 10,
-              tostr() << "Consumed unexpected number of messages. "
-                         "Expected 10, got: "
-                      << msgs.size());
-  test_assert(msgs[0]->key_len() >= 1 && 0x10 == msgs[0]->key()->c_str()[0],
+  TEST_ASSERT(msgs.size() == 10,
+              "Consumed unexpected number of messages. "
+              "Expected 10, got: %d", (int)msgs.size());
+  TEST_ASSERT(msgs[0]->key_len() >= 1 && 0x10 == msgs[0]->key()->c_str()[0],
               "Unexpected key");
-  test_assert(msgs[4]->key_len() >= 1 && 0x14 == msgs[4]->key()->c_str()[0],
+  TEST_ASSERT(msgs[4]->key_len() >= 1 && 0x14 == msgs[4]->key()->c_str()[0],
               "Unexpected key");
-  test_assert(msgs[5]->key_len() >= 1 && 0x30 == msgs[5]->key()->c_str()[0],
+  TEST_ASSERT(msgs[5]->key_len() >= 1 && 0x30 == msgs[5]->key()->c_str()[0],
               "Unexpected key");
-  test_assert(msgs[9]->key_len() >= 1 && 0x34 == msgs[9]->key()->c_str()[0],
+  TEST_ASSERT(msgs[9]->key_len() >= 1 && 0x34 == msgs[9]->key()->c_str()[0],
               "Unexpected key");
   delete_messages(msgs);
 
@@ -393,7 +619,7 @@ static void do_test_consumer_txn_test (void) {
   delete c;
 
 
-  // Test 1 - mixed with non-transactional.
+  Test::Say(_C_BLU "Test 1 - mixed with non-transactional.\n" _C_CLR);
 
   topic_name = Test::mk_topic_name("0098-consumer_txn-1", 1);
   c = create_consumer(topic_name, "READ_COMMITTED");
@@ -406,28 +632,29 @@ static void do_test_consumer_txn_test (void) {
 
   msgs = consume_messages(c, topic_name, 0);
 
-  test_assert(TestEventCb::partition_0_ls_offset != -1 &&
-              TestEventCb::partition_0_ls_offset == TestEventCb::partition_0_hi_offset,
-              tostr() << "Expected hi_offset to equal ls_offset "
-                         "but got hi_offset: "
-                      << TestEventCb::partition_0_hi_offset
-                      << ", ls_offset: "
-                      << TestEventCb::partition_0_ls_offset);
+  TEST_ASSERT(0,
+              "testar lite");
+  TEST_ASSERT(TestEventCb::partition_0_ls_offset != -1 &&
+              TestEventCb::partition_0_ls_offset ==
+              TestEventCb::partition_0_hi_offset,
+              "Expected hi_offset to equal ls_offset but "
+              "got hi_offset: %" PRId64 ", ls_offset: %" PRId64,
+              TestEventCb::partition_0_hi_offset,
+              TestEventCb::partition_0_ls_offset);
 
-  test_assert(msgs.size() == 10,
-              tostr() << "Consumed unexpected number of messages. "
-                         "Expected 10, got: "
-                      << msgs.size());
-  test_assert(msgs[0]->key_len() >= 1 &&
+  TEST_ASSERT(msgs.size() == 10,
+              "Consumed unexpected number of messages. "
+              "Expected 10, got: %d", (int)msgs.size());
+  TEST_ASSERT(msgs[0]->key_len() >= 1 &&
               0x10 == msgs[0]->key()->c_str()[0],
               "Unexpected key");
-  test_assert(msgs[4]->key_len() >= 1 &&
+  TEST_ASSERT(msgs[4]->key_len() >= 1 &&
               0x14 == msgs[4]->key()->c_str()[0],
               "Unexpected key");
-  test_assert(msgs[5]->key_len() >= 1 &&
+  TEST_ASSERT(msgs[5]->key_len() >= 1 &&
               0x50 == msgs[5]->key()->c_str()[0],
               "Unexpected key");
-  test_assert(msgs[9]->key_len() >= 1 &&
+  TEST_ASSERT(msgs[9]->key_len() >= 1 &&
               0x54 == msgs[9]->key()->c_str()[0],
               "Unexpected key");
   delete_messages(msgs);
@@ -438,7 +665,7 @@ static void do_test_consumer_txn_test (void) {
   delete c;
 
 
-  // Test 1.1
+  Test::Say(_C_BLU "Test 1.1\n" _C_CLR);
 
   topic_name = Test::mk_topic_name("0098-consumer_txn-1.1", 1);
   c = create_consumer(topic_name, "READ_COMMITTED");
@@ -450,17 +677,16 @@ static void do_test_consumer_txn_test (void) {
 
 
   msgs = consume_messages(c, topic_name, 0);
-  test_assert(msgs.size() == 10,
-              tostr() << "Consumed unexpected number of messages. "
-                         "Expected 10, got: "
-                      << msgs.size());
-  test_assert(msgs[0]->key_len() >= 1 && 0x40 == msgs[0]->key()->c_str()[0],
+  TEST_ASSERT(msgs.size() == 10,
+              "Consumed unexpected number of messages. "
+              "Expected 10, got: %d", (int)msgs.size());
+  TEST_ASSERT(msgs[0]->key_len() >= 1 && 0x40 == msgs[0]->key()->c_str()[0],
               "Unexpected key");
-  test_assert(msgs[4]->key_len() >= 1 && 0x44 == msgs[4]->key()->c_str()[0],
+  TEST_ASSERT(msgs[4]->key_len() >= 1 && 0x44 == msgs[4]->key()->c_str()[0],
               "Unexpected key");
-  test_assert(msgs[5]->key_len() >= 1 && 0x60 == msgs[5]->key()->c_str()[0],
+  TEST_ASSERT(msgs[5]->key_len() >= 1 && 0x60 == msgs[5]->key()->c_str()[0],
               "Unexpected key");
-  test_assert(msgs[9]->key_len() >= 1 && 0x64 == msgs[9]->key()->c_str()[0],
+  TEST_ASSERT(msgs[9]->key_len() >= 1 && 0x64 == msgs[9]->key()->c_str()[0],
               "Unexpected key");
   delete_messages(msgs);
 
@@ -470,7 +696,7 @@ static void do_test_consumer_txn_test (void) {
   delete c;
 
 
-  // Test 1.2
+  Test::Say(_C_BLU "Test 1.2\n" _C_CLR);
 
   topic_name = Test::mk_topic_name("0098-consumer_txn-1.2", 1);
   c = create_consumer(topic_name, "READ_COMMITTED");
@@ -481,17 +707,16 @@ static void do_test_consumer_txn_test (void) {
                "producer3, -1, 0x30, 5, None, DoFlush");
 
   msgs = consume_messages(c, topic_name, 0);
-  test_assert(msgs.size() == 10,
-              tostr() << "Consumed unexpected number of messages. "
-                         "Expected 10, got: "
-                      << msgs.size());
-  test_assert(msgs[0]->key_len() >= 1 && 0x10 == msgs[0]->key()->c_str()[0],
+  TEST_ASSERT(msgs.size() == 10,
+              "Consumed unexpected number of messages. "
+              "Expected 10, got: %d", (int)msgs.size());
+  TEST_ASSERT(msgs[0]->key_len() >= 1 && 0x10 == msgs[0]->key()->c_str()[0],
               "Unexpected key");
-  test_assert(msgs[4]->key_len() >= 1 && 0x14 == msgs[4]->key()->c_str()[0],
+  TEST_ASSERT(msgs[4]->key_len() >= 1 && 0x14 == msgs[4]->key()->c_str()[0],
               "Unexpected key");
-  test_assert(msgs[5]->key_len() >= 1 && 0x30 == msgs[5]->key()->c_str()[0],
+  TEST_ASSERT(msgs[5]->key_len() >= 1 && 0x30 == msgs[5]->key()->c_str()[0],
               "Unexpected key");
-  test_assert(msgs[9]->key_len() >= 1 && 0x34 == msgs[9]->key()->c_str()[0],
+  TEST_ASSERT(msgs[9]->key_len() >= 1 && 0x34 == msgs[9]->key()->c_str()[0],
               "Unexpected key");
   delete_messages(msgs);
 
@@ -501,7 +726,7 @@ static void do_test_consumer_txn_test (void) {
   delete c;
 
 
-  // Test 2 - rapid abort / committing.
+  Test::Say(_C_BLU "Test 2 - rapid abort / committing.\n" _C_CLR);
   // note: aborted records never seem to make it to the broker when not flushed.
 
   topic_name = Test::mk_topic_name("0098-consumer_txn-2", 1);
@@ -522,29 +747,28 @@ static void do_test_consumer_txn_test (void) {
                "producer3, -1, 0xc0, 1, None, DoFlush");
 
   msgs = consume_messages(c, topic_name, 0);
-  test_assert(msgs.size() == 7,
-              tostr() << "Consumed unexpected number of messages. "
-                         "Expected 7, got: "
-                      << msgs.size());
-  test_assert(msgs[0]->key_len() >= 1 &&
+  TEST_ASSERT(msgs.size() == 7,
+              "Consumed unexpected number of messages. "
+              "Expected 7, got: %d", (int)msgs.size());
+  TEST_ASSERT(msgs[0]->key_len() >= 1 &&
               0x20 == (unsigned char)msgs[0]->key()->c_str()[0],
               "Unexpected key");
-  test_assert(msgs[1]->key_len() >= 1 &&
+  TEST_ASSERT(msgs[1]->key_len() >= 1 &&
               0x40 == (unsigned char)msgs[1]->key()->c_str()[0],
               "Unexpected key");
-  test_assert(msgs[2]->key_len() >= 1 &&
+  TEST_ASSERT(msgs[2]->key_len() >= 1 &&
               0x60 == (unsigned char)msgs[2]->key()->c_str()[0],
               "Unexpected key");
-  test_assert(msgs[3]->key_len() >= 1 &&
+  TEST_ASSERT(msgs[3]->key_len() >= 1 &&
               0x80 == (unsigned char)msgs[3]->key()->c_str()[0],
               "Unexpected key");
-  test_assert(msgs[4]->key_len() >= 1 &&
+  TEST_ASSERT(msgs[4]->key_len() >= 1 &&
               0xa0 == (unsigned char)msgs[4]->key()->c_str()[0],
               "Unexpected key");
-  test_assert(msgs[5]->key_len() >= 1 &&
+  TEST_ASSERT(msgs[5]->key_len() >= 1 &&
               0xb0 == (unsigned char)msgs[5]->key()->c_str()[0],
               "Unexpected key");
-  test_assert(msgs[6]->key_len() >= 1 &&
+  TEST_ASSERT(msgs[6]->key_len() >= 1 &&
               0xc0 == (unsigned char)msgs[6]->key()->c_str()[0],
               "Unexpected key");
   delete_messages(msgs);
@@ -555,7 +779,7 @@ static void do_test_consumer_txn_test (void) {
   delete c;
 
 
-  // Test 2.1
+  Test::Say(_C_BLU "Test 2.1\n" _C_CLR);
 
   topic_name = Test::mk_topic_name("0098-consumer_txn-2.1", 1);
   c = create_consumer(topic_name, "READ_COMMITTED");
@@ -575,29 +799,28 @@ static void do_test_consumer_txn_test (void) {
                "producer3, -1, 0xc0, 1, None, DoFlush");
 
   msgs = consume_messages(c, topic_name, 0);
-  test_assert(msgs.size() == 7,
-              tostr() << "Consumed unexpected number of messages. "
-                         "Expected 7, got: "
-                      << msgs.size());
-  test_assert(msgs[0]->key_len() >= 1 &&
+  TEST_ASSERT(msgs.size() == 7,
+              "Consumed unexpected number of messages. "
+              "Expected 7, got: %d", (int)msgs.size());
+  TEST_ASSERT(msgs[0]->key_len() >= 1 &&
               0x20 == (unsigned char)msgs[0]->key()->c_str()[0],
               "Unexpected key");
-  test_assert(msgs[1]->key_len() >= 1 &&
+  TEST_ASSERT(msgs[1]->key_len() >= 1 &&
               0x40 == (unsigned char)msgs[1]->key()->c_str()[0],
               "Unexpected key");
-  test_assert(msgs[2]->key_len() >= 1 &&
+  TEST_ASSERT(msgs[2]->key_len() >= 1 &&
               0x60 == (unsigned char)msgs[2]->key()->c_str()[0],
               "Unexpected key");
-  test_assert(msgs[3]->key_len() >= 1 &&
+  TEST_ASSERT(msgs[3]->key_len() >= 1 &&
               0x80 == (unsigned char)msgs[3]->key()->c_str()[0],
               "Unexpected key");
-  test_assert(msgs[4]->key_len() >= 1 &&
+  TEST_ASSERT(msgs[4]->key_len() >= 1 &&
               0xa0 == (unsigned char)msgs[4]->key()->c_str()[0],
               "Unexpected key");
-  test_assert(msgs[5]->key_len() >= 1 &&
+  TEST_ASSERT(msgs[5]->key_len() >= 1 &&
               0xb0 == (unsigned char)msgs[5]->key()->c_str()[0],
               "Unexpected key");
-  test_assert(msgs[6]->key_len() >= 1 &&
+  TEST_ASSERT(msgs[6]->key_len() >= 1 &&
               0xc0 == (unsigned char)msgs[6]->key()->c_str()[0],
               "Unexpected key");
   delete_messages(msgs);
@@ -606,29 +829,28 @@ static void do_test_consumer_txn_test (void) {
 
   c = create_consumer(topic_name, "READ_UNCOMMITTED");
   msgs = consume_messages(c, topic_name, 0);
-  test_assert(msgs.size() == 12,
-              tostr() << "Consumed unexpected number of messages. "
-                         "Expected 12, got: "
-                      << msgs.size());
-  test_assert(msgs[0]->key_len() >= 1 &&
+  TEST_ASSERT(msgs.size() == 12,
+              "Consumed unexpected number of messages. "
+              "Expected 12, got: %d", (int)msgs.size());
+  TEST_ASSERT(msgs[0]->key_len() >= 1 &&
               0x10 == (unsigned char)msgs[0]->key()->c_str()[0],
               "Unexpected key");
-  test_assert(msgs[1]->key_len() >= 1 &&
+  TEST_ASSERT(msgs[1]->key_len() >= 1 &&
               0x20 == (unsigned char)msgs[1]->key()->c_str()[0],
               "Unexpected key");
-  test_assert(msgs[2]->key_len() >= 1 &&
+  TEST_ASSERT(msgs[2]->key_len() >= 1 &&
               0x30 == (unsigned char)msgs[2]->key()->c_str()[0],
               "Unexpected key");
-  test_assert(msgs[3]->key_len() >= 1 &&
+  TEST_ASSERT(msgs[3]->key_len() >= 1 &&
               0x40 == (unsigned char)msgs[3]->key()->c_str()[0],
               "Unexpected key");
-  test_assert(msgs[4]->key_len() >= 1 &&
+  TEST_ASSERT(msgs[4]->key_len() >= 1 &&
               0x50 == (unsigned char)msgs[4]->key()->c_str()[0],
               "Unexpected key");
-  test_assert(msgs[5]->key_len() >= 1 &&
+  TEST_ASSERT(msgs[5]->key_len() >= 1 &&
               0x60 == (unsigned char)msgs[5]->key()->c_str()[0],
               "Unexpected key");
-  test_assert(msgs[6]->key_len() >= 1 &&
+  TEST_ASSERT(msgs[6]->key_len() >= 1 &&
               0x70 == (unsigned char)msgs[6]->key()->c_str()[0],
               "Unexpected key");
   delete_messages(msgs);
@@ -639,7 +861,7 @@ static void do_test_consumer_txn_test (void) {
   delete c;
 
 
-  // Test 3 - cross partition (simple).
+  Test::Say(_C_BLU "Test 3 - cross partition (simple).\n" _C_CLR);
 
   topic_name = Test::mk_topic_name("0098-consumer_txn-3", 1);
   c = create_consumer(topic_name, "READ_COMMITTED");
@@ -650,32 +872,28 @@ static void do_test_consumer_txn_test (void) {
                "producer1, 0, 0x30, 3, ContinueCommit, DoFlush");
 
   msgs = consume_messages(c, topic_name, 0);
-  test_assert(msgs.size() == 6,
-              tostr() << "Consumed unexpected number of messages. "
-                         "Expected 6, got: "
-                      << msgs.size());
+  TEST_ASSERT(msgs.size() == 6,
+              "Consumed unexpected number of messages. "
+              "Expected 6, got: %d", (int)msgs.size());
   delete_messages(msgs);
   msgs = consume_messages(c, topic_name, 1);
-  test_assert(msgs.size() == 3,
-              tostr() << "Consumed unexpected number of messages. "
-                         "Expected 3, got: "
-                      << msgs.size());
+  TEST_ASSERT(msgs.size() == 3,
+              "Consumed unexpected number of messages. "
+              "Expected 3, got: %d", (int)msgs.size());
   delete_messages(msgs);
   c->close();
   delete c;
 
   c = create_consumer(topic_name, "READ_UNCOMMITTED");
   msgs = consume_messages(c, topic_name, 0);
-  test_assert(msgs.size() == 6,
-              tostr() << "Consumed unexpected number of messages. "
-                         "Expected 6, got: "
-                      << msgs.size());
+  TEST_ASSERT(msgs.size() == 6,
+              "Consumed unexpected number of messages. "
+              "Expected 6, got: %d", (int)msgs.size());
   delete_messages(msgs);
   msgs = consume_messages(c, topic_name, 1);
-  test_assert(msgs.size() == 3,
-              tostr() << "Consumed unexpected number of messages. "
-                         "Expected 3, got: "
-                      << msgs.size());
+  TEST_ASSERT(msgs.size() == 3,
+              "Consumed unexpected number of messages. "
+              "Expected 3, got: %d", (int)msgs.size());
   delete_messages(msgs);
 
   Test::delete_topic(c, topic_name.c_str());
@@ -684,7 +902,7 @@ static void do_test_consumer_txn_test (void) {
   delete c;
 
 
-  // Test 3.1
+  Test::Say(_C_BLU "Test 3.1\n" _C_CLR);
 
   topic_name = Test::mk_topic_name("0098-consumer_txn-3.1", 1);
   c = create_consumer(topic_name, "READ_COMMITTED");
@@ -698,23 +916,21 @@ static void do_test_consumer_txn_test (void) {
                "producer1, 1, 0x44, 1, BeginCommit, DoFlush");
 
   msgs = consume_messages(c, topic_name, 0);
-  test_assert(msgs.size() == 2,
-              tostr() << "Consumed unexpected number of messages. "
-                         "Expected 2, got: "
-                      << msgs.size());
-  test_assert(msgs[0]->key_len() >= 1 &&
+  TEST_ASSERT(msgs.size() == 2,
+             "Consumed unexpected number of messages. "
+              "Expected 2, got: %d", (int)msgs.size());
+  TEST_ASSERT(msgs[0]->key_len() >= 1 &&
               0x55 == (unsigned char)msgs[0]->key()->c_str()[0],
               "Unexpected key");
-  test_assert(msgs[1]->key_len() >= 1 &&
+  TEST_ASSERT(msgs[1]->key_len() >= 1 &&
               0x00 == (unsigned char)msgs[1]->key()->c_str()[0],
               "Unexpected key");
   delete_messages(msgs);
   msgs = consume_messages(c, topic_name, 1);
-  test_assert(msgs.size() == 1,
-              tostr() << "Consumed unexpected number of messages. "
-                         "Expected 1, got: "
-                      << msgs.size());
-  test_assert(msgs[0]->key_len() >= 1 &&
+  TEST_ASSERT(msgs.size() == 1,
+              "Consumed unexpected number of messages. "
+              "Expected 1, got: %d", (int)msgs.size());
+  TEST_ASSERT(msgs[0]->key_len() >= 1 &&
               0x44 == (unsigned char)msgs[0]->key()->c_str()[0],
               "Unexpected key");
   delete_messages(msgs);
@@ -725,7 +941,7 @@ static void do_test_consumer_txn_test (void) {
   delete c;
 
 
-  // Test 4 - simultaneous transactions (simple).
+  Test::Say(_C_BLU "Test 4 - simultaneous transactions (simple).\n" _C_CLR);
 
   topic_name = Test::mk_topic_name("0098-consumer_txn-4", 1);
   c = create_consumer(topic_name, "READ_COMMITTED");
@@ -738,20 +954,18 @@ static void do_test_consumer_txn_test (void) {
                "producer2, 0, 0x50, 3, ContinueAbort, DoFlush");
 
   msgs = consume_messages(c, topic_name, 0);
-  test_assert(msgs.size() == 7,
-              tostr() << "Consumed unexpected number of messages. "
-                         "Expected 7, got: "
-                      << msgs.size());
+  TEST_ASSERT(msgs.size() == 7,
+              "Consumed unexpected number of messages. "
+              "Expected 7, got: %d", (int)msgs.size());
   delete_messages(msgs);
   c->close();
   delete c;
 
   c = create_consumer(topic_name, "READ_UNCOMMITTED");
   msgs = consume_messages(c, topic_name, 0);
-  test_assert(msgs.size() == 13,
-              tostr() << "Consumed unexpected number of messages. "
-                         "Expected 13, got: "
-                      << msgs.size());
+  TEST_ASSERT(msgs.size() == 13,
+              "Consumed unexpected number of messages. "
+              "Expected 13, got: %d", (int)msgs.size());
   delete_messages(msgs);
 
   Test::delete_topic(c, topic_name.c_str());
@@ -760,7 +974,7 @@ static void do_test_consumer_txn_test (void) {
   delete c;
 
 
-  // Test 4.1
+  Test::Say(_C_BLU "Test 4.1\n" _C_CLR);
 
   topic_name = Test::mk_topic_name("0098-consumer_txn-4.1", 1);
   c = create_consumer(topic_name, "READ_COMMITTED");
@@ -773,20 +987,18 @@ static void do_test_consumer_txn_test (void) {
                "producer2, 0, 0x50, 3, ContinueCommit, DoFlush");
 
   msgs = consume_messages(c, topic_name, 0);
-  test_assert(msgs.size() == 7,
-              tostr() << "Consumed unexpected number of messages. "
-                         "Expected 7, got: "
-                      << msgs.size());
+  TEST_ASSERT(msgs.size() == 7,
+              "Consumed unexpected number of messages. "
+              "Expected 7, got: %d", (int)msgs.size());
   delete_messages(msgs);
   c->close();
   delete c;
 
   c = create_consumer(topic_name, "READ_UNCOMMITTED");
   msgs = consume_messages(c, topic_name, 0);
-  test_assert(msgs.size() == 13,
-              tostr() << "Consumed unexpected number of messages. "
-                         "Expected 13, got: "
-                      << msgs.size());
+  TEST_ASSERT(msgs.size() == 13,
+              "Consumed unexpected number of messages. "
+              "Expected 13, got: %d", (int)msgs.size());
   delete_messages(msgs);
 
   Test::delete_topic(c, topic_name.c_str());
@@ -795,7 +1007,7 @@ static void do_test_consumer_txn_test (void) {
   delete c;
 
 
-  // Test 4.2
+  Test::Say(_C_BLU "Test 4.2\n" _C_CLR);
 
   topic_name = Test::mk_topic_name("0098-consumer_txn-4.2", 1);
   c = create_consumer(topic_name, "READ_COMMITTED");
@@ -808,20 +1020,18 @@ static void do_test_consumer_txn_test (void) {
                "producer2, 0, 0x50, 3, ContinueCommit, DoFlush");
 
   msgs = consume_messages(c, topic_name, 0);
-  test_assert(msgs.size() == 13,
-              tostr() << "Consumed unexpected number of messages. "
-                         "Expected 7, got: "
-                      << msgs.size());
+  TEST_ASSERT(msgs.size() == 13,
+              "Consumed unexpected number of messages. "
+              "Expected 7, got: %d", (int)msgs.size());
   delete_messages(msgs);
   c->close();
   delete c;
 
   c = create_consumer(topic_name, "READ_UNCOMMITTED");
   msgs = consume_messages(c, topic_name, 0);
-  test_assert(msgs.size() == 13,
-              tostr() << "Consumed unexpected number of messages. "
-                         "Expected 13, got: "
-                      << msgs.size());
+  TEST_ASSERT(msgs.size() == 13,
+              "Consumed unexpected number of messages. "
+              "Expected 13, got: %d", (int)msgs.size());
   delete_messages(msgs);
 
   Test::delete_topic(c, topic_name.c_str());
@@ -830,7 +1040,7 @@ static void do_test_consumer_txn_test (void) {
   delete c;
 
 
-  // Test 4.3
+  Test::Say(_C_BLU "Test 4.3\n" _C_CLR);
 
   topic_name = Test::mk_topic_name("0098-consumer_txn-4.3", 1);
   c = create_consumer(topic_name, "READ_COMMITTED");
@@ -843,20 +1053,18 @@ static void do_test_consumer_txn_test (void) {
                "producer2, 0, 0x50, 3, ContinueAbort, DoFlush");
 
   msgs = consume_messages(c, topic_name, 0);
-  test_assert(msgs.size() == 1,
-              tostr() << "Consumed unexpected number of messages. "
-                         "Expected 7, got: "
-                      << msgs.size());
+  TEST_ASSERT(msgs.size() == 1,
+              "Consumed unexpected number of messages. "
+              "Expected 7, got: %d", (int)msgs.size());
   delete_messages(msgs);
   c->close();
   delete c;
 
   c = create_consumer(topic_name, "READ_UNCOMMITTED");
   msgs = consume_messages(c, topic_name, 0);
-  test_assert(msgs.size() == 13,
-              tostr() << "Consumed unexpected number of messages. "
-                         "Expected 13, got: "
-                      << msgs.size());
+  TEST_ASSERT(msgs.size() == 13,
+              "Consumed unexpected number of messages. "
+              "Expected 13, got: ", (int)msgs.size());
   delete_messages(msgs);
 
   Test::delete_topic(c, topic_name.c_str());
@@ -866,7 +1074,7 @@ static void do_test_consumer_txn_test (void) {
 
 
 
-  // Test 5 - split transaction across message sets.
+  Test::Say(_C_BLU "Test 5 - split transaction across message sets.\n" _C_CLR);
 
 test5:
   topic_name = Test::mk_topic_name("0098-consumer_txn-5", 1);
@@ -888,35 +1096,34 @@ test5:
                "producer3, 0, 0x70, 1, None, DoFlush");
 
   msgs = consume_messages(c, topic_name, 0);
-  test_assert(msgs.size() == 9,
-              tostr() << "Consumed unexpected number of messages. "
-                         "Expected 9, got: "
-                      << msgs.size());
-  test_assert(msgs[0]->key_len() >= 1 &&
+  TEST_ASSERT(msgs.size() == 9,
+              "Consumed unexpected number of messages. "
+              "Expected 9, got: %d", (int)msgs.size());
+  TEST_ASSERT(msgs[0]->key_len() >= 1 &&
               0x30 == (unsigned char)msgs[0]->key()->c_str()[0],
               "Unexpected key");
-  test_assert(msgs[1]->key_len() >= 1 &&
+  TEST_ASSERT(msgs[1]->key_len() >= 1 &&
               0x31 == (unsigned char)msgs[1]->key()->c_str()[0],
               "Unexpected key");
-  test_assert(msgs[2]->key_len() >= 1 &&
+  TEST_ASSERT(msgs[2]->key_len() >= 1 &&
               0x40 == (unsigned char)msgs[2]->key()->c_str()[0],
               "Unexpected key");
-  test_assert(msgs[3]->key_len() >= 1 &&
+  TEST_ASSERT(msgs[3]->key_len() >= 1 &&
               0x41 == (unsigned char)msgs[3]->key()->c_str()[0],
               "Unexpected key");
-  test_assert(msgs[4]->key_len() >= 1 &&
+  TEST_ASSERT(msgs[4]->key_len() >= 1 &&
               0xa0 == (unsigned char)msgs[4]->key()->c_str()[0],
               "Unexpected key");
-  test_assert(msgs[5]->key_len() >= 1 &&
+  TEST_ASSERT(msgs[5]->key_len() >= 1 &&
               0xa1 == (unsigned char)msgs[5]->key()->c_str()[0],
               "Unexpected key");
-  test_assert(msgs[6]->key_len() >= 1 &&
+  TEST_ASSERT(msgs[6]->key_len() >= 1 &&
               0xb0 == (unsigned char)msgs[6]->key()->c_str()[0],
               "Unexpected key");
-  test_assert(msgs[7]->key_len() >= 1 &&
+  TEST_ASSERT(msgs[7]->key_len() >= 1 &&
               0xb1 == (unsigned char)msgs[7]->key()->c_str()[0],
               "Unexpected key");
-  test_assert(msgs[8]->key_len() >= 1 &&
+  TEST_ASSERT(msgs[8]->key_len() >= 1 &&
               0x70 == (unsigned char)msgs[8]->key()->c_str()[0],
               "Unexpected key");
   delete_messages(msgs);
@@ -927,7 +1134,7 @@ test5:
   delete c;
 
 
-  // Test 6 - transaction left open
+  Test::Say(_C_BLU "Test 6 - transaction left open\n" _C_CLR);
 
   topic_name = Test::mk_topic_name("0098-consumer_txn-0", 1);
   c = create_consumer(topic_name, "READ_COMMITTED");
@@ -940,18 +1147,16 @@ test5:
                "exit,0");
 
   msgs = consume_messages(c, topic_name, 0);
-  test_assert(msgs.size() == 1,
-              tostr() << "Consumed unexpected number of messages. "
-                         "Expected 1, got: "
-                      << msgs.size());
+  TEST_ASSERT(msgs.size() == 1,
+              "Consumed unexpected number of messages. "
+              "Expected 1, got: %d", (int)msgs.size());
 
-  test_assert(TestEventCb::partition_0_ls_offset + 3 ==
+  TEST_ASSERT(TestEventCb::partition_0_ls_offset + 3 ==
               TestEventCb::partition_0_hi_offset,
-              tostr() << "Expected hi_offset to be 3 greater than ls_offset "
-                         "but got hi_offset: "
-                      << TestEventCb::partition_0_hi_offset
-                      << ", ls_offset: "
-                      << TestEventCb::partition_0_ls_offset);
+              "Expected hi_offset to be 3 greater than ls_offset "
+              "but got hi_offset: %" PRId64 ", ls_offset: %" PRId64,
+              TestEventCb::partition_0_hi_offset,
+              TestEventCb::partition_0_ls_offset);
 
   delete_messages(msgs);
 
@@ -972,7 +1177,8 @@ extern "C" {
       return 0;
     }
 #if WITH_RAPIDJSON
-    do_test_consumer_txn_test();
+    //do_test_consumer_txn_test(true /* with java producer */);
+    do_test_consumer_txn_test(false /* with librdkafka producer */);
 #else
     Test::Skip("RapidJSON >=1.1.0 not available\n");
 #endif

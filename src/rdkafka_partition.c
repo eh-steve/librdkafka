@@ -1708,8 +1708,15 @@ err_reply:
 }
 
 
+/**
+ * @brief Pause/resume toppar.
+ *
+ * This is the internal handler of the pause/resume op.
+ *
+ * @locality toppar's handler thread
+ */
 static void rd_kafka_toppar_pause_resume (rd_kafka_toppar_t *rktp,
-					  rd_kafka_op_t *rko_orig) {
+                                          rd_kafka_op_t *rko_orig) {
 	rd_kafka_t *rk = rktp->rktp_rkt->rkt_rk;
 	int pause = rko_orig->rko_u.pause.pause;
 	int flag = rko_orig->rko_u.pause.flag;
@@ -2294,6 +2301,33 @@ rd_kafka_toppar_op_pause_resume (rd_kafka_toppar_t *rktp, int pause, int flag,
 }
 
 
+/**
+ * @brief Pause a toppar (asynchronous).
+ *
+ * @param flag is either RD_KAFKA_TOPPAR_F_APP_PAUSE or .._F_LIB_PAUSE
+ *             depending on if the app paused or librdkafka.
+ *
+ * @locality any
+ * @locks none needed
+ */
+void rd_kafka_toppar_pause (rd_kafka_toppar_t *rktp, int flag) {
+        rd_kafka_toppar_op_pause_resume(rktp, 1/*pause*/, flag,
+                                        RD_KAFKA_NO_REPLYQ);
+}
+
+/**
+ * @brief Resume a toppar (asynchronous).
+ *
+ * @param flag is either RD_KAFKA_TOPPAR_F_APP_PAUSE or .._F_LIB_PAUSE
+ *             depending on if the app paused or librdkafka.
+ *
+ * @locality any
+ * @locks none needed
+ */
+void rd_kafka_toppar_resume (rd_kafka_toppar_t *rktp, int flag) {
+        rd_kafka_toppar_op_pause_resume(rktp, 1/*pause*/, flag,
+                                        RD_KAFKA_NO_REPLYQ);
+}
 
 
 

@@ -73,7 +73,13 @@ test_produce_msgs_easy_size (const char *topic, uint64_t testid,
 #define test_produce_msgs_easy(topic,testid,partition,msgcnt) \
         test_produce_msgs_easy_size(topic,testid,partition,msgcnt,0)
 
-void test_FAIL (const char *file, int line, int fail_now, const char *str);
+
+void test_fail0 (const char *file, int line, const char *function,
+                 int do_lock, int fail_now, const char *fmt, ...);
+
+
+
+
 void test_SAY (const char *file, int line, int level, const char *str);
 void test_SKIP (const char *file, int line, const char *str);
 
